@@ -4,47 +4,36 @@ import (
 	"context"
 	"log"
 
-	"github.com/beltran/gohive"
+	"github.com/arikfr/godbsql"
 )
 
 func main() {
 	ctx := context.Background()
-	configuration := gohive.NewConnectConfiguration()
-	configuration.Service = "hive"
-	configuration.FetchSize = 1000
-	// Previously kinit should have done: kinit -kt ./secret.keytab hive/hs2.example.com@EXAMPLE.COM
-	connection, errConn := gohive.Connect("hs2.example.com", 10000, "KERBEROS", configuration)
+	configuration := godbsql.NewConnectConfiguration()
+	configuration.HTTPPath = "sql/1.0/endpoints/5e89f447c123a5s8" // this is the default path in hive configuration.
+	configuration.Token = "dapi..."
+
+	connection, errConn := godbsql.Connect("demo.cloud.databricks.com", configuration)
+
+	log.Println("Connecting")
 	if errConn != nil {
 		log.Fatal(errConn)
 	}
+	log.Println("Cursor")
 	cursor := connection.Cursor()
 
-	cursor.Exec(ctx, "CREATE TABLE myTable (a INT, b STRING)")
-	if cursor.Err != nil {
-		log.Fatal(cursor.Err)
-	}
-
-	cursor.Exec(ctx, "INSERT INTO myTable VALUES(1, '1'), (2, '2'), (3, '3'), (4, '4')")
-	if cursor.Err != nil {
-		log.Fatal(cursor.Err)
-	}
-
-	cursor.Exec(ctx, "SELECT * FROM myTable")
+	cursor.Exec(ctx, "SELECT 1")
 	if cursor.Err != nil {
 		log.Fatal(cursor.Err)
 	}
 
 	var i int32
-	var s string
 	for cursor.HasMore(ctx) {
+		cursor.FetchOne(ctx, &i)
 		if cursor.Err != nil {
 			log.Fatal(cursor.Err)
 		}
-		cursor.FetchOne(ctx, &i, &s)
-		if cursor.Err != nil {
-			log.Fatal(cursor.Err)
-		}
-		log.Println(i, s)
+		log.Println(i)
 	}
 
 	cursor.Close()
