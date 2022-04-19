@@ -1,63 +1,47 @@
-package gohive
+package godbsql
 
 import (
 	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
-	"os/user"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/apache/thrift/lib/go/thrift"
-	"github.com/beltran/gohive/hiveserver"
-	"github.com/beltran/gosasl"
-	"github.com/go-zookeeper/zk"
+	"github.com/arikfr/godbsql/hiveserver"
 	"github.com/pkg/errors"
 )
 
 const DEFAULT_FETCH_SIZE int64 = 1000
-const ZOOKEEPER_DEFAULT_NAMESPACE = "hiveserver2"
 
 type DialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
 // Connection holds the information for getting a cursor to hive
 type Connection struct {
-	host                string
-	port                int
-	username            string
-	database            string
-	auth                string
-	kerberosServiceName string
-	password            string
-	sessionHandle       *hiveserver.TSessionHandle
-	client              *hiveserver.TCLIServiceClient
-	configuration       *ConnectConfiguration
-	transport           thrift.TTransport
+	host          string
+	database      string
+	token         string
+	sessionHandle *hiveserver.TSessionHandle
+	client        *hiveserver.TCLIServiceClient
+	configuration *ConnectConfiguration
+	transport     thrift.TTransport
 }
 
 // ConnectConfiguration is the configuration for the connection
 // The fields have to be filled manually but not all of them are required
 // Depends on the auth and kind of connection.
 type ConnectConfiguration struct {
-	Username             string
-	Principal            string
-	Password             string
-	Service              string
+	Token                string
 	HiveConfiguration    map[string]string
 	PollIntervalInMillis int
 	FetchSize            int64
-	TransportMode        string
 	HTTPPath             string
 	TLSConfig            *tls.Config
-	ZookeeperNamespace   string
 	Database             string
 	ConnectTimeout       time.Duration
 	SocketTimeout        time.Duration
@@ -68,16 +52,12 @@ type ConnectConfiguration struct {
 // NewConnectConfiguration returns a connect configuration, all with empty fields
 func NewConnectConfiguration() *ConnectConfiguration {
 	return &ConnectConfiguration{
-		Username:             "",
-		Password:             "",
-		Service:              "",
+		Token:                "",
 		HiveConfiguration:    nil,
 		PollIntervalInMillis: 200,
 		FetchSize:            DEFAULT_FETCH_SIZE,
-		TransportMode:        "binary",
-		HTTPPath:             "cliservice",
+		HTTPPath:             "",
 		TLSConfig:            nil,
-		ZookeeperNamespace:   ZOOKEEPER_DEFAULT_NAMESPACE,
 	}
 }
 
@@ -91,51 +71,8 @@ type HiveError struct {
 	ErrorCode int
 }
 
-// Connect to zookeper to get hive hosts and then connect to hive.
-// hosts is in format host1:port1,host2:port2,host3:port3 (zookeeper hosts).
-func ConnectZookeeper(hosts string, auth string,
-	configuration *ConnectConfiguration) (conn *Connection, err error) {
-	// consider host as zookeeper quorum
-	zkHosts := strings.Split(hosts, ",")
-	zkConn, _, err := zk.Connect(zkHosts, time.Second)
-	if err != nil {
-		return nil, err
-	}
-
-	hsInfos, _, err := zkConn.Children("/" + configuration.ZookeeperNamespace)
-	if err != nil {
-		panic(err)
-	}
-	if len(hsInfos) > 0 {
-		nodes := parseHiveServer2Info(hsInfos)
-		rand.Shuffle(len(nodes), func(i, j int) {
-			nodes[i], nodes[j] = nodes[j], nodes[i]
-		})
-		for _, node := range nodes {
-			port, err := strconv.Atoi(node["port"])
-			if err != nil {
-				continue
-			}
-			conn, err := innerConnect(context.TODO(), node["host"], port, auth, configuration)
-			if err != nil {
-				// Let's try to connect to the next one
-				continue
-			}
-			return conn, nil
-		}
-		return nil, errors.Errorf("all Hive servers of the specified Zookeeper namespace %s are unavailable",
-			configuration.ZookeeperNamespace)
-	} else {
-		return nil, errors.Errorf("no Hive server is registered in the specified Zookeeper namespace %s",
-			configuration.ZookeeperNamespace)
-	}
-
-}
-
-// Connect to hive server
-func Connect(host string, port int, auth string,
-	configuration *ConnectConfiguration) (conn *Connection, err error) {
-	return innerConnect(context.TODO(), host, port, auth, configuration)
+func Connect(host string, configuration *ConnectConfiguration) (conn *Connection, err error) {
+	return innerConnect(context.TODO(), host, 443, configuration)
 }
 
 func parseHiveServer2Info(hsInfos []string) []map[string]string {
@@ -182,7 +119,7 @@ func dial(ctx context.Context, addr string, dialFn DialContextFunc, timeout time
 	return dialFn(dctx, "tcp", addr)
 }
 
-func innerConnect(ctx context.Context, host string, port int, auth string,
+func innerConnect(ctx context.Context, host string, port int,
 	configuration *ConnectConfiguration) (conn *Connection, err error) {
 
 	var socket thrift.TTransport
@@ -231,97 +168,27 @@ func innerConnect(ctx context.Context, host string, port int, auth string,
 	if configuration == nil {
 		configuration = NewConnectConfiguration()
 	}
-	if configuration.Username == "" {
-		_user, err := user.Current()
-		if err != nil {
-			return nil, errors.New("Can't determine the username")
-		}
-		configuration.Username = strings.Replace(_user.Name, " ", "", -1)
-	}
-	// password may not matter but can't be empty
-	if configuration.Password == "" {
-		configuration.Password = "x"
+
+	if configuration.Token == "" {
+		return nil, errors.New("Token can't be empty")
 	}
 
-	if configuration.TransportMode == "http" {
-		if auth == "NONE" {
-			httpClient, protocol, err := getHTTPClient(configuration)
-			if err != nil {
-				return nil, err
-			}
-			httpOptions := thrift.THttpClientOptions{Client: httpClient}
-			transport, err = thrift.NewTHttpClientTransportFactoryWithOptions(fmt.Sprintf(protocol+"://%s:%s@%s:%d/"+configuration.HTTPPath, url.QueryEscape(configuration.Username), url.QueryEscape(configuration.Password), host, port), httpOptions).GetTransport(socket)
-			if err != nil {
-				return nil, err
-			}
-		} else if auth == "KERBEROS" {
-			mechanism, err := gosasl.NewGSSAPIMechanism(configuration.Service)
-			if err != nil {
-				return nil, err
-			}
-			saslClient := gosasl.NewSaslClient(host, mechanism)
-			token, err := saslClient.Start()
-			if err != nil {
-				return nil, err
-			}
-			if len(token) == 0 {
-				return nil, errors.New("Gssapi init context returned an empty token. Probably the service is empty in the configuration")
-			}
+	if configuration.TLSConfig == nil {
+		configuration.TLSConfig = &tls.Config{}
+	}
 
-			httpClient, protocol, err := getHTTPClient(configuration)
-			if err != nil {
-				return nil, err
-			}
-			httpClient.Jar = newCookieJar()
-
-			httpOptions := thrift.THttpClientOptions{
-				Client: httpClient,
-			}
-			transport, err = thrift.NewTHttpClientTransportFactoryWithOptions(fmt.Sprintf(protocol+"://%s:%d/"+configuration.HTTPPath, host, port), httpOptions).GetTransport(socket)
-			httpTransport, ok := transport.(*thrift.THttpClient)
-			if ok {
-				httpTransport.SetHeader("Authorization", "Negotiate "+base64.StdEncoding.EncodeToString(token))
-			}
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			panic("Unrecognized auth")
-		}
-	} else if configuration.TransportMode == "binary" {
-		if auth == "NOSASL" {
-			transport = thrift.NewTBufferedTransport(socket, 4096)
-			if transport == nil {
-				return nil, errors.New("BufferedTransport was nil")
-			}
-		} else if auth == "NONE" || auth == "LDAP" || auth == "CUSTOM" {
-			saslConfiguration := map[string]string{"username": configuration.Username, "password": configuration.Password}
-			transport, err = NewTSaslTransport(socket, host, "PLAIN", saslConfiguration)
-			if err != nil {
-				return
-			}
-		} else if auth == "KERBEROS" {
-			saslConfiguration := map[string]string{"service": configuration.Service}
-			transport, err = NewTSaslTransport(socket, host, "GSSAPI", saslConfiguration)
-			if err != nil {
-				return
-			}
-		} else if auth == "DIGEST-MD5" {
-			saslConfiguration := map[string]string{"username": configuration.Username, "password": configuration.Password, "service": configuration.Service}
-			transport, err = NewTSaslTransport(socket, host, "DIGEST-MD5", saslConfiguration)
-			if err != nil {
-				return
-			}
-		} else {
-			panic("Unrecognized auth")
-		}
-		if !transport.IsOpen() {
-			if err = transport.Open(); err != nil {
-				return
-			}
-		}
-	} else {
-		panic("Unrecognized transport mode " + configuration.TransportMode)
+	httpClient, protocol, err := getHTTPClient(configuration)
+	if err != nil {
+		return nil, err
+	}
+	httpOptions := thrift.THttpClientOptions{Client: httpClient}
+	transport, err = thrift.NewTHttpClientTransportFactoryWithOptions(fmt.Sprintf(protocol+"://%s:%s@%s:%d/"+configuration.HTTPPath, "token", url.QueryEscape(configuration.Token), host, port), httpOptions).GetTransport(socket)
+	httpTransport, ok := transport.(*thrift.THttpClient)
+	if ok {
+		httpTransport.SetHeader("User-Agent", "pydatabrickssqlconnector/0.9.0 (godbsql)")
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	protocolFactory := thrift.NewTBinaryProtocolFactoryDefault()
@@ -330,8 +197,7 @@ func innerConnect(ctx context.Context, host string, port int, auth string,
 	openSession := hiveserver.NewTOpenSessionReq()
 	openSession.ClientProtocol = hiveserver.TProtocolVersion_HIVE_CLI_SERVICE_PROTOCOL_V6
 	openSession.Configuration = configuration.HiveConfiguration
-	openSession.Username = &configuration.Username
-	openSession.Password = &configuration.Password
+	openSession.Password = &configuration.Token
 	// Context is ignored
 	response, err := client.OpenSession(context.Background(), openSession)
 	if err != nil {
@@ -343,15 +209,12 @@ func innerConnect(ctx context.Context, host string, port int, auth string,
 		database = "default"
 	}
 	connection := &Connection{
-		host:                host,
-		port:                port,
-		database:            database,
-		auth:                auth,
-		kerberosServiceName: "",
-		sessionHandle:       response.SessionHandle,
-		client:              client,
-		configuration:       configuration,
-		transport:           transport,
+		host:          host,
+		database:      database,
+		sessionHandle: response.SessionHandle,
+		client:        client,
+		configuration: configuration,
+		transport:     transport,
 	}
 
 	if configuration.Database != "" {
